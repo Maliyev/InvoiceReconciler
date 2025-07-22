@@ -7,6 +7,7 @@ import re
 BANK_HISTORY_FILE = 'Bank History.xls'
 INVOICES_FILE = 'Invoices.xlsx'
 OUTPUT_FILE = 'reconciliation_report.xlsx'
+COMPANY_REPORT_FILE = 'company_debt_report.xlsx'
 
 # --- 2. Загрузка и подготовка данных ---
 
@@ -276,13 +277,125 @@ def reconcile_invoices(invoices_df, bank_history_df):
         print(f"ОШИБКА при сохранении отчета: {e}")
 
 
-# --- 4. Точка входа ---
+# --- 4. Логика отчета по компаниям ---
+def generate_company_report(invoices_df, bank_history_df):
+    """
+    Генерирует отчет о задолженности по каждой компании.
+    """
+    print("\nНачало генерации отчета по компаниям...")
+
+    # Шаг 1: Сопоставление VÖEN-ов с компаниями
+    company_voen_map = invoices_df.groupby('Company_Name')['VOEN'].unique().apply(list).to_dict()
+
+    # Шаг 2: Сбор всех финансовых событий по компаниям
+    company_events = {}
+
+    # Добавляем инвойсы как события
+    for index, invoice in invoices_df.iterrows():
+        company_name = invoice['Company_Name']
+        if company_name not in company_events:
+            company_events[company_name] = []
+        company_events[company_name].append({
+            'Date': invoice['Invoice_Date'],
+            'Type': 'Invoice',
+            'Amount': invoice['Total_Amount'],
+            'Description': f"INV {invoice['Invoice_Num']}"
+        })
+
+    # Добавляем платежи как события
+    for index, payment in bank_history_df.iterrows():
+        payment_voen = payment['Payment_VOEN']
+        # Находим компанию, которой принадлежит VÖEN
+        for company, voens in company_voen_map.items():
+            if payment_voen in voens:
+                if company not in company_events:
+                    company_events[company] = []
+                company_events[company].append({
+                    'Date': payment['Payment_Date'],
+                    'Type': 'Payment',
+                    'Amount': payment['Payment_Amount'],
+                    'Description': payment['Description']
+                })
+                break # Переходим к следующему платежу
+
+    # Сортируем события по дате для каждой компании
+    for company in company_events:
+        company_events[company].sort(key=lambda x: x['Date'])
+
+    print("Сбор и сортировка финансовых событий завершены.")
+    # print(company_events) # Отладочный вывод
+
+    # Шаг 3: Генерация Excel-файла с форматированием
+    try:
+        writer = pd.ExcelWriter(COMPANY_REPORT_FILE, engine='xlsxwriter')
+        workbook = writer.book
+        worksheet = workbook.add_worksheet('Company Debt Report')
+
+        # Форматы ячеек
+        header_format = workbook.add_format({'bold': True, 'align': 'center', 'valign': 'vcenter', 'border': 1})
+        voen_format = workbook.add_format({'align': 'center', 'valign': 'vcenter', 'border': 1})
+        invoice_format = workbook.add_format({'bg_color': '#FFFFCC', 'num_format': '#,##0.00'}) # Светло-желтый
+        payment_format = workbook.add_format({'bg_color': '#CCFFCC', 'num_format': '#,##0.00'}) # Светло-зеленый
+        balance_format = workbook.add_format({'bold': True, 'num_format': '#,##0.00', 'top': 1})
+
+        current_col = 0
+        for company, events in company_events.items():
+            # --- Заголовок компании ---
+            worksheet.merge_range(0, current_col, 0, current_col + 3, company, header_format)
+
+            # --- VÖEN-ы ---
+            voens = ", ".join(company_voen_map.get(company, []))
+            worksheet.merge_range(1, current_col, 1, current_col + 3, f"VÖEN(s): {voens}", voen_format)
+
+            # --- Заголовки столбцов ---
+            worksheet.write(2, current_col, 'Дата')
+            worksheet.write(2, current_col + 1, 'Описание')
+            worksheet.write(2, current_col + 2, 'Сумма')
+            worksheet.write(2, current_col + 3, 'Баланс')
+
+            # --- Запись событий ---
+            current_row = 3
+            balance = 0
+            for event in events:
+                balance += event['Amount'] if event['Type'] == 'Invoice' else -event['Amount']
+                worksheet.write(current_row, current_col, event['Date'].strftime('%d-%m-%Y'))
+                worksheet.write(current_row, current_col + 1, event['Description'])
+                
+                cell_format = invoice_format if event['Type'] == 'Invoice' else payment_format
+                amount_display = event['Amount'] if event['Type'] == 'Invoice' else -event['Amount']
+                worksheet.write(current_row, current_col + 2, amount_display, cell_format)
+                worksheet.write(current_row, current_col + 3, balance, balance_format)
+                current_row += 1
+
+            # --- Итоговый баланс ---
+            worksheet.write(current_row, current_col + 2, 'Итог:', balance_format)
+            worksheet.write(current_row, current_col + 3, balance, balance_format)
+
+            # --- Настройка ширины столбцов ---
+            worksheet.set_column(current_col, current_col, 12)
+            worksheet.set_column(current_col + 1, current_col + 1, 25)
+            worksheet.set_column(current_col + 2, current_col + 3, 15)
+
+            current_col += 4 # Переходим к следующему блоку для новой компании
+
+        writer.close()
+        print(f"Отчет по компаниям успешно сохранен в {COMPANY_REPORT_FILE}")
+    except Exception as e:
+        print(f"ОШИБКА при создании отчета по компаниям: {e}")
+
+
+# --- 5. Точка входа ---
 if __name__ == "__main__":
     invoices = load_invoices(INVOICES_FILE)
     bank_history = load_bank_history(BANK_HISTORY_FILE)
 
     if invoices is not None and bank_history is not None:
+        # Отчет о сверке
         reconcile_invoices(invoices, bank_history)
+        
+        # Отчет о задолженности компаний
+        generate_company_report(invoices, bank_history)
+
         print("\nПроцесс завершен.")
     else:
         print("\nНе удалось загрузить один из файлов. Проверьте ошибки выше.")
