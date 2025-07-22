@@ -79,6 +79,8 @@ def load_bank_history(file_path):
         # Заменяем запятые на точки для корректного преобразования в число
         df['Payment_Amount'] = df['Payment_Amount'].astype(str).str.replace(',', '.', regex=False)
         df['Payment_Amount'] = pd.to_numeric(df['Payment_Amount'], errors='coerce')
+        # Делим на 100, так как суммы могут быть завышены из-за отсутствия десятичной точки
+        df['Payment_Amount'] = df['Payment_Amount'] / 100
 
         # 3. Сортируем по дате
         df = df.sort_values(by='Payment_Date').reset_index(drop=True)
@@ -96,8 +98,183 @@ def load_bank_history(file_path):
 def reconcile_invoices(invoices_df, bank_history_df):
     """Основная функция для сопоставления счетов и транзакций."""
     print("Начало процесса сопоставления...")
-    # (Здесь будет основная логика, которую мы добавим на следующем шаге)
-    pass
+
+    # Создаем копию DataFrame для отслеживания изменений
+    invoices_working_df = invoices_df.copy()
+    bank_history_working_df = bank_history_df.copy()
+
+    # Список для хранения результатов сопоставления
+    reconciliation_results = []
+
+    # Проходим по каждой банковской транзакции
+    for index, payment in bank_history_working_df.iterrows():
+        current_payment_amount = payment['Payment_Amount']
+        current_payment_voen = payment['Payment_VOEN']
+        payment_processed = False # Флаг, был ли платеж сопоставлен хоть с чем-то
+
+        # Ищем неоплаченные счета для текущего VÖEN
+        matching_invoices = invoices_working_df[
+            (invoices_working_df['VOEN'] == current_payment_voen) &
+            (invoices_working_df['Remaining_Amount'] > 0)
+        ].sort_values(by='Invoice_Date') # Сортируем по дате, чтобы сначала погашать старые счета
+
+        for inv_idx, invoice in matching_invoices.iterrows():
+            if current_payment_amount <= 0:
+                break # Платеж исчерпан
+
+            amount_to_apply = min(current_payment_amount, invoice['Remaining_Amount'])
+
+            # Обновляем остаток по счету
+            invoices_working_df.loc[inv_idx, 'Remaining_Amount'] -= amount_to_apply
+            # Обновляем статус счета
+            if invoices_working_df.loc[inv_idx, 'Remaining_Amount'] <= 0:
+                invoices_working_df.loc[inv_idx, 'Status'] = 'Оплачен полностью'
+            elif invoices_working_df.loc[inv_idx, 'Remaining_Amount'] < invoices_working_df.loc[inv_idx, 'Total_Amount']:
+                invoices_working_df.loc[inv_idx, 'Status'] = 'Оплачен частично'
+
+            # Уменьшаем текущую сумму платежа
+            current_payment_amount -= amount_to_apply
+            payment_processed = True
+
+            # Добавляем запись о сопоставлении
+            reconciliation_results.append({
+                'Bank_Payment_Date': payment['Payment_Date'],
+                'Bank_Payment_VOEN': payment['Payment_VOEN'],
+                'Bank_Payment_Amount': payment['Payment_Amount'],
+                'Bank_Description': payment['Description'],
+                'Applied_Amount': amount_to_apply,
+                'Invoice_Num': invoice['Invoice_Num'],
+                'Invoice_VOEN': invoice['VOEN'],
+                'Invoice_Company_Name': invoice['Company_Name'],
+                'Invoice_Date': invoice['Invoice_Date'],
+                'Invoice_Total_Amount': invoice['Total_Amount'],
+                'Invoice_Remaining_Amount_After_Payment': invoices_working_df.loc[inv_idx, 'Remaining_Amount'],
+                'Invoice_Status': invoices_working_df.loc[inv_idx, 'Status']
+            })
+
+        # Если платеж не был полностью использован или не нашел соответствий
+        if current_payment_amount > 0 and not payment_processed:
+            reconciliation_results.append({
+                'Bank_Payment_Date': payment['Payment_Date'],
+                'Bank_Payment_VOEN': payment['Payment_VOEN'],
+                'Bank_Payment_Amount': payment['Payment_Amount'],
+                'Bank_Description': payment['Description'],
+                'Applied_Amount': 0, # Не сопоставлено
+                'Invoice_Num': None,
+                'Invoice_VOEN': None,
+                'Invoice_Company_Name': None,
+                'Invoice_Date': None,
+                'Invoice_Total_Amount': None,
+                'Invoice_Remaining_Amount_After_Payment': None,
+                'Invoice_Status': 'Платеж без соответствия'
+            })
+        elif current_payment_amount > 0 and payment_processed:
+             # Если платеж был частично использован, но остался остаток
+             reconciliation_results.append({
+                'Bank_Payment_Date': payment['Payment_Date'],
+                'Bank_Payment_VOEN': payment['Payment_VOEN'],
+                'Bank_Payment_Amount': payment['Payment_Amount'],
+                'Bank_Description': payment['Description'],
+                'Applied_Amount': payment['Payment_Amount'] - current_payment_amount, # Сколько было применено
+                'Invoice_Num': None, # Это остаток платежа, не привязанный к конкретному инвойсу
+                'Invoice_VOEN': None,
+                'Invoice_Company_Name': None,
+                'Invoice_Date': None,
+                'Invoice_Total_Amount': None,
+                'Invoice_Remaining_Amount_After_Payment': None,
+                'Invoice_Status': f'Остаток платежа: {current_payment_amount:.2f}'
+            })
+
+
+    # Создаем DataFrame из результатов сопоставления
+    results_df = pd.DataFrame(reconciliation_results)
+
+    # Переименовываем столбцы для отчета
+    results_df.rename(columns={
+        'Bank_Payment_Date': 'Дата Оп.',
+        'Bank_Payment_VOEN': 'ВОЕН Банк',
+        'Bank_Payment_Amount': 'Сумма Оп.',
+        'Bank_Description': 'Описание Оп.',
+        'Applied_Amount': 'Применено',
+        'Invoice_Num': '№ Инв.',
+        'Invoice_VOEN': 'ВОЕН Инв.',
+        'Invoice_Company_Name': 'Компания',
+        'Invoice_Date': 'Дата Инв.',
+        'Invoice_Total_Amount': 'Сумма Инв.',
+        'Invoice_Remaining_Amount_After_Payment': 'Остаток Инв.',
+        'Invoice_Status': 'Статус Инв.'
+    }, inplace=True)
+
+    # Добавляем неоплаченные/частично оплаченные счета в конец отчета
+    unpaid_invoices = invoices_working_df[invoices_working_df['Remaining_Amount'] > 0].copy()
+    if not unpaid_invoices.empty:
+        # Создаем пустые столбцы для банковских данных
+        for col in ['Bank_Payment_Date', 'Bank_Payment_VOEN', 'Bank_Payment_Amount', 'Bank_Description', 'Applied_Amount']:
+            unpaid_invoices[col] = np.nan
+
+        # Переименовываем столбцы для соответствия общему формату
+        unpaid_invoices.rename(columns={
+            'Invoice_Num': '№ Инв.',
+            'VOEN': 'ВОЕН Инв.',
+            'Company_Name': 'Компания',
+            'Invoice_Date': 'Дата Инв.',
+            'Total_Amount': 'Сумма Инв.',
+            'Remaining_Amount': 'Остаток Инв.',
+            'Status': 'Статус Инв.'
+        }, inplace=True)
+
+        # Выбираем и переупорядочиваем столбцы для неоплаченных счетов
+        unpaid_invoices = unpaid_invoices[[
+            'Bank_Payment_Date', 'Bank_Payment_VOEN', 'Bank_Payment_Amount', 'Bank_Description', 'Applied_Amount',
+            '№ Инв.', 'ВОЕН Инв.', 'Компания', 'Дата Инв.', 'Сумма Инв.',
+            'Остаток Инв.', 'Статус Инв.'
+        ]]
+        results_df = pd.concat([results_df, unpaid_invoices], ignore_index=True)
+
+    # Явно преобразуем столбцы с датами в datetime после конкатенации
+    for col in ['Дата Оп.', 'Дата Инв.']:
+        if col in results_df.columns:
+            results_df[col] = pd.to_datetime(results_df[col], errors='coerce')
+
+    # Форматируем столбцы с датами перед сохранением
+    for col in ['Дата Оп.', 'Дата Инв.']:
+        if col in results_df.columns:
+            results_df[col] = results_df[col].dt.date
+
+    # Сохраняем результат в Excel файл
+    try:
+        writer = pd.ExcelWriter(OUTPUT_FILE, engine='xlsxwriter')
+        results_df.to_excel(writer, index=False, sheet_name='Reconciliation Report')
+
+        workbook  = writer.book
+        worksheet = writer.sheets['Reconciliation Report']
+
+        # Определяем ширину столбцов в пикселях, затем конвертируем в единицы Excel
+        # Это приблизительная конвертация (пиксели / 7), может потребоваться корректировка
+        column_widths_px = [
+            80,  # Bank_Payment_Date
+            75,  # Bank_Payment_VOEN
+            30,  # Bank_Payment_Amount
+            140, # Bank_Description
+            80,  # Applied_Amount
+            40,  # Invoice_Num
+            80,  # Invoice_VOEN
+            140, # Invoice_Company_Name
+            80,  # Invoice_Date
+            110, # Invoice_Total_Amount
+            90,  # Invoice_Remaining_Amount_After_Payment
+            90   # Invoice_Status (предполагаем такую же ширину)
+        ]
+
+        for i, width_px in enumerate(column_widths_px):
+            excel_width = width_px / 7.0  # Примерный коэффициент конвертации
+            worksheet.set_column(i, i, excel_width)
+
+        writer.close() # Используем close() вместо save() для новых версий pandas
+        print(f"Процесс сопоставления завершен. Отчет сохранен в {OUTPUT_FILE}")
+    except Exception as e:
+        print(f"ОШИБКА при сохранении отчета: {e}")
+
 
 # --- 4. Точка входа ---
 if __name__ == "__main__":
